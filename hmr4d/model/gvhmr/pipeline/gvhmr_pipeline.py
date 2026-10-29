@@ -27,6 +27,7 @@ from hmr4d.utils.geo.hmr_global import (
     rollout_local_transl_vel,
     get_static_joint_mask,
     get_tgtcoord_rootparam,
+    GV_FRAME_FNS,
 )
 from hmr4d.utils.wis3d_utils import make_wis3d, add_motion_as_lines
 from hmr4d.utils.smplx_utils import make_smplx
@@ -82,12 +83,22 @@ class Pipeline(nn.Module):
             "transl": compute_transl_full_cam(model_output["pred_cam"], inputs["bbx_xys"], inputs["K_fullimg"]),
         }
         if not train:
-            pred_smpl_params_global = get_smpl_params_w_Rt_v2(  # This function has for-loop
-                global_orient_gv=decode_dict["global_orient_gv"],
-                local_transl_vel=decode_dict["local_transl_vel"],
-                global_orient_c=decode_dict["global_orient"],
-                cam_angvel=inputs["cam_angvel"],
-            )
+            gv_frame = self.args.get("gv_frame", None)  # None: original v2 rollout (released ckpt)
+            if gv_frame is None:
+                pred_smpl_params_global = get_smpl_params_w_Rt_v2(  # This function has for-loop
+                    global_orient_gv=decode_dict["global_orient_gv"],
+                    local_transl_vel=decode_dict["local_transl_vel"],
+                    global_orient_c=decode_dict["global_orient"],
+                    cam_angvel=inputs["cam_angvel"],
+                )
+            else:
+                pred_smpl_params_global = get_smpl_params_w_Rt_v3(
+                    global_orient_gv=decode_dict["global_orient_gv"],
+                    local_transl_vel=decode_dict["local_transl_vel"],
+                    global_orient_c=decode_dict["global_orient"],
+                    cam_angvel=inputs["cam_angvel"],
+                    gv_frame=gv_frame,
+                )
             outputs["pred_smpl_params_global"] = {
                 "body_pose": decode_dict["body_pose"],
                 "betas": decode_dict["betas"],
@@ -382,3 +393,46 @@ def get_smpl_params_w_Rt_v2(
 
     smpl_params_w_Rt = {"global_orient": global_orient, "transl": transl}
     return smpl_params_w_Rt
+
+
+@autocast(enabled=False)
+def get_smpl_params_w_Rt_v3(
+    global_orient_gv,
+    local_transl_vel,
+    global_orient_c,
+    cam_angvel,
+    gv_frame="view",
+    smooth=True,
+):
+    """Heading rollout as a 1-D (rotor-in-the-ground-plane) integration.
+
+    Both GV frame constructions are functions of gravity-in-camera alone, and any two GV frames
+    share their y axis, so the frame change t -> t+1 is a pure yaw M_t. Yaws about one axis
+    commute, so the chain R_t_to_0 = M_0^-1 ... M_{t-1}^-1 is a cumsum of angles: no for-loop,
+    no acos, no projection of the view axis. With gv_frame="view" this reproduces v2 (minus v2's
+    one-frame index offset); gv_frame="rotor" matches a model trained with GVHMR_GV_FRAME=rotor.
+    """
+    frame_fn = GV_FRAME_FNS[gv_frame]
+    R_t_to_tp1 = rotation_6d_to_matrix(cam_angvel)  # (B, L, 3, 3), cam_t coords -> cam_{t+1} coords
+    R_gv = axis_angle_to_matrix(global_orient_gv)
+    R_c = axis_angle_to_matrix(global_orient_c)
+
+    # gravity in camera, from the network's own estimate of R_c2gv (its y row)
+    g_c = (R_gv @ R_c.mT)[..., 1, :]  # (B, L, 3)
+    g_c_next = torch.einsum("...ij,...j->...i", R_t_to_tp1, g_c)  # propagate with the camera
+    F_t, F_next = frame_fn(g_c), frame_fn(g_c_next)
+    M = F_next @ R_t_to_tp1 @ F_t.mT  # GV_t -> GV_{t+1}, a pure yaw about y
+    dyaw = torch.atan2(M[..., 0, 2], M[..., 0, 0])  # (B, L)
+    if smooth:
+        dyaw = gaussian_smooth(dyaw, dim=-1)
+
+    # R_t_to_0 = yaw(-sum_{k<t} dyaw_k)
+    yaw = -torch.cumsum(F.pad(dyaw[:, :-1], (1, 0)), dim=-1)  # (B, L)
+    c, s = torch.cos(yaw), torch.sin(yaw)
+    z, o = torch.zeros_like(c), torch.ones_like(c)
+    R_t_to_0 = torch.stack([c, z, s, z, o, z, -s, z, c], dim=-1).reshape(*yaw.shape, 3, 3)
+
+    global_orient = matrix_to_axis_angle(R_t_to_0 @ R_gv)
+    transl = rollout_local_transl_vel(local_transl_vel, global_orient)
+    global_orient, transl, _ = get_tgtcoord_rootparam(global_orient, transl, tsf="any->ay")
+    return {"global_orient": global_orient, "transl": transl}

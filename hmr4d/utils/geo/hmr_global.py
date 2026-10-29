@@ -1,10 +1,53 @@
+import os
+import torch.nn.functional as F
 import torch
 from pytorch3d.transforms import axis_angle_to_matrix, matrix_to_axis_angle, matrix_to_quaternion, quaternion_to_matrix
 import hmr4d.utils.matrix as matrix
 from hmr4d.utils.net_utils import gaussian_smooth
 
 
-def get_R_c2gv(R_w2c, axis_gravity_in_w=[0, 0, -1]):
+# Which gravity-view frame to build. "view" is the original GVHMR construction (heading = camera
+# view axis projected onto the ground; singular when the camera looks straight up or down).
+# "rotor" is the shortest-arc frame (singular only when the camera is upside down). Any heading
+# definition must be singular somewhere (no continuous SO(3) -> S^1 retraction exists), so the
+# choice is where to put the singularity. Datasets read this, so set GVHMR_GV_FRAME before training.
+GV_FRAME_MODE = os.environ.get("GVHMR_GV_FRAME", "view")
+
+
+def rotor_c2gv_from_gravity(g_c, eps=1e-6):
+    """Shortest-arc rotation taking gravity-in-camera to +y (the GA rotor (1 + y g)/|1 + y g|).
+    Args:
+        g_c: (*, 3) gravity direction in camera coordinates (normalized internally)
+    Returns:
+        R_c2gv: (*, 3, 3)
+    """
+    g = F.normalize(g_c, dim=-1)
+    c = g[..., 1]  # g . y
+    # quaternion (w, v) = (1 + g.y, g x y) with y = (0, 1, 0)  ->  g x y = (-g_z, 0, g_x)
+    w = 1.0 + c
+    q = torch.stack([w, -g[..., 2], torch.zeros_like(c), g[..., 0]], dim=-1)
+    flip = w < eps  # upside-down camera: rotate pi about camera x
+    if flip.any():
+        q[flip] = torch.tensor([0.0, 1.0, 0.0, 0.0], dtype=q.dtype, device=q.device)
+    return quaternion_to_matrix(F.normalize(q, dim=-1))
+
+
+def view_c2gv_from_gravity(g_c):
+    """Original GVHMR frame, written as a function of gravity-in-camera only."""
+    axis_y = F.normalize(g_c, dim=-1)
+    axis_z_in_c = torch.tensor([0.0, 0.0, 1.0], dtype=g_c.dtype, device=g_c.device).expand_as(axis_y)
+    axis_x = axis_y.cross(axis_z_in_c, dim=-1)
+    n = axis_x.norm(dim=-1, keepdim=True)
+    axis_x = axis_x / (n + 1e-5)
+    axis_x[n.squeeze(-1) < 1e-5] = torch.tensor([1.0, 0.0, 0.0], dtype=g_c.dtype, device=g_c.device)
+    axis_z = axis_x.cross(axis_y, dim=-1)
+    return torch.stack([axis_x, axis_y, axis_z], dim=-1).transpose(-1, -2)
+
+
+GV_FRAME_FNS = {"view": view_c2gv_from_gravity, "rotor": rotor_c2gv_from_gravity}
+
+
+def get_R_c2gv(R_w2c, axis_gravity_in_w=[0, 0, -1], mode=None):
     """
     Args:
         R_w2c: (*, 3, 3)
@@ -13,6 +56,10 @@ def get_R_c2gv(R_w2c, axis_gravity_in_w=[0, 0, -1]):
     """
     if isinstance(axis_gravity_in_w, list):
         axis_gravity_in_w = torch.tensor(axis_gravity_in_w).float()  # gravity direction in world coord
+    mode = mode or GV_FRAME_MODE
+    if mode != "view":
+        g_c = torch.einsum("...ij,j->...i", R_w2c, axis_gravity_in_w.to(R_w2c))
+        return GV_FRAME_FNS[mode](g_c)
     axis_z_in_c = torch.tensor([0, 0, 1]).float()
 
     # get gv-coord axes in in c-coord
