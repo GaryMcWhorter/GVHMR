@@ -42,6 +42,12 @@ def parse_args_to_cfg():
     parser.add_argument("--video", type=str, default="inputs/demo/dance_3.mp4")
     parser.add_argument("--output_root", type=str, default=None, help="by default to outputs/demo")
     parser.add_argument("-s", "--static_cam", action="store_true", help="If true, skip DPVO")
+    parser.add_argument(
+        "--static_pp",
+        choices=["lsq", "legacy"],
+        default="lsq",
+        help="Static-camera root post-process: lsq solves camera, velocity, contact and ground terms jointly; legacy is the original",
+    )
     parser.add_argument("--use_dpvo", action="store_true", help="If true, use DPVO. By default not using DPVO.")
     parser.add_argument(
         "--f_mm",
@@ -65,6 +71,7 @@ def parse_args_to_cfg():
         overrides = [
             f"video_name={video_path.stem}",
             f"static_cam={args.static_cam}",
+            f"static_pp={args.static_pp}",
             f"verbose={args.verbose}",
             f"use_dpvo={args.use_dpvo}",
         ]
@@ -320,7 +327,7 @@ if __name__ == "__main__":
         model.load_pretrained_model(cfg.ckpt_path)
         model = model.eval().cuda()
         tic = Log.sync_time()
-        pred = model.predict(data, static_cam=cfg.static_cam)
+        pred = model.predict(data, static_cam=cfg.static_cam, static_cam_pp=cfg.static_pp)
         pred = detach_to_cpu(pred)
         data_time = data["length"] / 30
         Log.info(f"[HMR4D] Elapsed: {Log.sync_time() - tic:.2f}s for data-length={data_time:.1f}s")

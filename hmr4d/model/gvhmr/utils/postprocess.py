@@ -12,6 +12,7 @@ from hmr4d.utils.ik.ccd_ik import CCD_IK
 from hmr4d.utils.geo_transform import get_sequence_cammat, transform_mat, apply_T_on_points
 from hmr4d.utils.net_utils import gaussian_smooth
 from hmr4d.model.gvhmr.utils.endecoder import EnDecoder
+from hmr4d.model.gvhmr.utils.static_cam_solve import solve_static_cam_root, chordal_mean
 
 from hmr4d.utils.wis3d_utils import make_wis3d, add_motion_as_lines
 
@@ -116,6 +117,46 @@ def pp_static_joint_cam(outputs, endecoder: EnDecoder):
     post_w_transl[..., 1] -= ground_y
 
     return post_w_transl
+
+
+@autocast(enabled=False)
+def pp_static_cam_lsq(outputs, endecoder: EnDecoder, **solver_kwargs):
+    """Static camera: solve the global root trajectory from the in-camera translation, the world
+    velocity rollout, contact and ground constraints at once (see static_cam_solve.py).
+    Returns transl (B, L, 3) in the global (y-up) frame, ground at y = 0.
+    """
+    incam = outputs["pred_smpl_params_incam"]
+    glob = outputs["pred_smpl_params_global"]
+    B, L = glob["transl"].shape[:2]
+    joint_ids = [7, 10, 8, 11, 20, 21]  # [L_Ankle, L_foot, R_Ankle, R_foot, L_wrist, R_wrist]
+    foot_idx = [1, 3]  # positions of L_foot / R_foot in joint_ids: these touch the ground when planted
+
+    # world joints with zero translation: root joint sits at the skeleton's rest pelvis position
+    w_j3d0 = endecoder.fk_v2(glob["body_pose"], glob["betas"], glob["global_orient"])  # (B, L, 22, 3)
+    offsets = w_j3d0 - w_j3d0[:, :, :1]
+    pelvis_c = endecoder.fk_v2(**incam)[:, :, 0]  # (B, L, 3)
+    vel = glob["transl"][:, 1:] - glob["transl"][:, :-1]
+    vel = torch.cat([vel, vel[:, -1:]], dim=1)
+    R_w = axis_angle_to_matrix(glob["global_orient"])
+    R_c = axis_angle_to_matrix(incam["global_orient"])
+    R_c2w_per_frame = R_w @ R_c.mT  # (B, L, 3, 3); constant for a static camera, so average it
+    prob = outputs["static_conf_logits"].sigmoid()
+
+    out = []
+    for b in range(B):
+        R_c2w = chordal_mean(R_c2w_per_frame[b].double().cpu().numpy())
+        p, _ = solve_static_cam_root(
+            pelvis_c[b].double().cpu().numpy(),
+            offsets[b].double().cpu().numpy(),
+            vel[b].double().cpu().numpy(),
+            prob[b].double().cpu().numpy(),
+            joint_ids,
+            R_c2w,
+            foot_joints=foot_idx,
+            **solver_kwargs,
+        )
+        out.append(torch.from_numpy(p).to(glob["transl"]) - w_j3d0[b, :, 0])  # transl = pelvis - rest root
+    return torch.stack(out)
 
 
 @autocast(enabled=False)

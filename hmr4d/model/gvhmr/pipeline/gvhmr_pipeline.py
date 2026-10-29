@@ -13,6 +13,7 @@ from hmr4d.model.gvhmr.utils.postprocess import (
     pp_static_joint,
     process_ik,
     pp_static_joint_cam,
+    pp_static_cam_lsq,
 )
 from hmr4d.model.gvhmr.utils import stats_compose
 
@@ -52,7 +53,7 @@ class Pipeline(nn.Module):
 
     # ========== Training ========== #
 
-    def forward(self, inputs, train=False, postproc=False, static_cam=False):
+    def forward(self, inputs, train=False, postproc=False, static_cam=False, static_cam_pp="legacy"):
         outputs = dict()
         length = inputs["length"]  # (B,) effective length of each sample
 
@@ -107,7 +108,9 @@ class Pipeline(nn.Module):
             outputs["static_conf_logits"] = model_output["static_conf_logits"]
 
             if postproc:  # apply post-processing
-                if static_cam:  # extra post-processing to utilize static camera prior
+                if static_cam and static_cam_pp == "lsq":  # joint least-squares over all static-camera cues
+                    outputs["pred_smpl_params_global"]["transl"] = pp_static_cam_lsq(outputs, self.endecoder)
+                elif static_cam:  # extra post-processing to utilize static camera prior
                     outputs["pred_smpl_params_global"]["transl"] = pp_static_joint_cam(outputs, self.endecoder)
                 else:
                     outputs["pred_smpl_params_global"]["transl"] = pp_static_joint(outputs, self.endecoder)

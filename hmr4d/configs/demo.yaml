@@ -27,6 +27,7 @@ video_path: "${output_dir}/0_input_video.mp4"
 
 # Options
 static_cam: False
+static_pp: lsq  # static-camera root post-process: lsq (joint solve) or legacy (original)
 verbose: False
 use_dpvo: False
 f_mm: null  # focal length of fullframe camera in mm
