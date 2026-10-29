@@ -15,6 +15,7 @@ from hmr4d.model.gvhmr.utils.postprocess import (
     pp_static_joint_cam,
     pp_static_cam_lsq,
     process_footlock,
+    smooth_pose_rotations,
 )
 from hmr4d.model.gvhmr.utils import stats_compose
 
@@ -110,6 +111,7 @@ class Pipeline(nn.Module):
 
             if postproc:  # apply post-processing
                 if static_cam and static_cam_pp == "lsq":  # joint least-squares over all static-camera cues
+                    smooth_pose_rotations(outputs)  # steadier offsets for the solve and the IK
                     outputs["pred_smpl_params_global"]["transl"] = pp_static_cam_lsq(outputs, self.endecoder)
                 elif static_cam:  # extra post-processing to utilize static camera prior
                     outputs["pred_smpl_params_global"]["transl"] = pp_static_joint_cam(outputs, self.endecoder)

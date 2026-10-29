@@ -14,6 +14,7 @@ from hmr4d.utils.net_utils import gaussian_smooth
 from hmr4d.model.gvhmr.utils.endecoder import EnDecoder
 from hmr4d.model.gvhmr.utils.static_cam_solve import solve_static_cam_root, chordal_mean
 from hmr4d.model.gvhmr.utils.foot_lock import contact_lock_targets, two_bone_ik
+from hmr4d.model.gvhmr.utils.rot_filter import smooth_axis_angle
 
 from hmr4d.utils.wis3d_utils import make_wis3d, add_motion_as_lines
 
@@ -262,3 +263,17 @@ def process_footlock(outputs, endecoder, pin_to_floor=True, **lock_kwargs):
                                 p_a, torch.zeros_like(wt[:, :, ia]), toe_tgt, wt[:, :, it])
     body_pose = matrix_to_axis_angle(matrix.get_rotation(local_mat[:, :, 1:]))
     return body_pose.flatten(2)
+
+
+@autocast(enabled=False)
+def smooth_pose_rotations(outputs, **kw):
+    """Speed-adaptive, zero-lag smoothing of joint and root rotations (in place).
+    Body pose is shared by the in-camera and global results; each root orientation is smoothed
+    in its own frame."""
+    B, L = outputs["pred_smpl_params_global"]["body_pose"].shape[:2]
+    bp = outputs["pred_smpl_params_global"]["body_pose"].reshape(B, L, 21, 3)
+    bp = smooth_axis_angle(bp, **kw).reshape(B, L, 63)
+    for key in ("pred_smpl_params_global", "pred_smpl_params_incam"):
+        outputs[key]["body_pose"] = bp
+        outputs[key]["global_orient"] = smooth_axis_angle(outputs[key]["global_orient"], **kw)
+    return outputs

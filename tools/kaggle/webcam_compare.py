@@ -46,6 +46,7 @@ from hmr4d.model.gvhmr.utils.postprocess import (  # noqa: E402
     process_ik,
     pp_static_cam_lsq,
     process_footlock,
+    smooth_pose_rotations,
 )
 from hmr4d.model.gvhmr.utils.foot_lock import contact_intervals  # noqa: E402
 from hmr4d.model.gvhmr.utils.static_cam_solve import chordal_mean  # noqa: E402
@@ -75,6 +76,7 @@ def make_cfg(video, out_root):
 def apply_pp(raw, enc, mode):
     o = copy.deepcopy(raw)
     if mode == "lsq":
+        smooth_pose_rotations(o)
         o["pred_smpl_params_global"]["transl"] = pp_static_cam_lsq(o, enc)
         body_pose = process_footlock(o, enc, pin_to_floor=True)
     else:
