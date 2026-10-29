@@ -87,6 +87,18 @@ class PycolmapRansacTwoViewGeometrySolver:
         )
         print(self.options.summary())
 
+        # Options for solve_with_info. pycolmap's watermark detector flags pairs whose matches
+        # barely move as an overlaid logo and returns no pose. Between video frames that pattern
+        # is just a slow or static camera (on tennis.mp4 a third of keyframe pairs hit it, and
+        # solve() raises on them), so it is disabled here.
+        self.options_vo = pycolmap.TwoViewGeometryOptions(
+            min_num_inliers=10,
+            min_E_F_inlier_ratio=0.8,
+            max_H_inlier_ratio=0.9,
+            compute_relative_pose=True,
+            detect_watermark=False,
+        )
+
     def get_K(self):
         return self.camera_matrix
 
@@ -106,6 +118,29 @@ class PycolmapRansacTwoViewGeometrySolver:
         T = np.eye(4)
         T[:3] = Rt
         return T
+
+    def solve_with_info(self, pts0, pts1):
+        """Like solve(), but returns (T or None, num_inliers) instead of raising on failure."""
+        if len(pts0) < self.options_vo.min_num_inliers:
+            return None, 0
+        matches = np.stack([np.arange(len(pts0)), np.arange(len(pts0))], axis=-1)
+        try:
+            answer = pycolmap.estimate_calibrated_two_view_geometry(
+                self.camera,
+                pts0.astype(np.float64),
+                self.camera,
+                pts1.astype(np.float64),
+                matches=matches,
+                options=self.options_vo,
+            )
+        except Exception:
+            return None, 0
+        if getattr(answer, "cam2_from_cam1", None) is None:
+            return None, 0
+        n_inliers = len(answer.inlier_matches) if getattr(answer, "inlier_matches", None) is not None else 0
+        T = np.eye(4)
+        T[:3] = answer.cam2_from_cam1.matrix().astype(np.float32)
+        return T, n_inliers
 
 
 two_pair_solver_map = {
@@ -139,6 +174,10 @@ class TwoPairSolver:
             T: np.ndarray, shape (4, 4), dtype=np.float32
         """
         return self.solver.solve(pts0, pts1)
+
+    def solve_with_info(self, pts0, pts1):
+        """Returns (T (4, 4) or None if geometry estimation failed, num_inliers)."""
+        return self.solver.solve_with_info(pts0, pts1)
 
 
 ########################################################
