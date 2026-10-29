@@ -18,6 +18,7 @@ Three post-processes are scored against the truth:
 """
 
 import argparse
+import sys
 import importlib.util
 import json
 from pathlib import Path
@@ -29,6 +30,8 @@ _p = Path(__file__).resolve().parents[2] / "hmr4d/model/gvhmr/utils/static_cam_s
 _spec = importlib.util.spec_from_file_location("static_cam_solve", _p)
 scs = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(scs)
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from hmr4d.model.gvhmr.utils.foot_lock import contact_lock_targets  # noqa: E402
 
 FPS = 30
 # joint layout used here: 0 pelvis, 1 L ankle, 2 R ankle, 3 L foot, 4 R foot
@@ -199,10 +202,36 @@ def align_xz(est, true):
     return out
 
 
-def metrics(p_est, offsets_pred, joints, contact):
+def legacy_feet(p, offsets_pred, prob):
+    """Port of process_ik's target blending: target_t = target_{t-1} * c + pos_t * (1 - c)."""
+    pos = p[:, None] + offsets_pred[:, CONTACT_JOINTS]
+    tgt = pos.copy()
+    for t in range(1, len(pos)):
+        c = prob[t - 1][:, None]
+        tgt[t] = tgt[t - 1] * c + pos[t] * (1 - c)
+    return tgt
+
+
+def lock_feet(p, offsets_pred, prob):
+    pos = p[:, None] + offsets_pred[:, CONTACT_JOINTS]
+    tgt, w = contact_lock_targets(pos, prob, ground=FOOT_IDX)
+    return tgt
+
+
+def metrics(p_est, offsets_pred, joints, contact, feet=None):
     true_p = joints[:, 0]
     p = align_xz(p_est, true_p)
-    feet = p[:, None] + offsets_pred[:, CONTACT_JOINTS]
+    if feet is None:
+        feet = p[:, None] + offsets_pred[:, CONTACT_JOINTS]
+    else:  # feet given in the estimate's frame: apply the same alignment
+        moved = p - p_est
+        e, t = p_est[:, [0, 2]], true_p[:, [0, 2]]
+        em, tm = e.mean(0), t.mean(0)
+        U, _, Vt = np.linalg.svd((e - em).T @ (t - tm))
+        R = (U @ Vt).T
+        f = feet.copy()
+        f[..., [0, 2]] = (feet[..., [0, 2]] - em) @ R.T + tm
+        feet = f
     st = contact[:-1] & contact[1:]
     horiz = np.linalg.norm((feet[1:] - feet[:-1])[..., [0, 2]], axis=-1)
     toe_y = feet[:, FOOT_IDX, 1][contact[:, FOOT_IDX]]  # true value is 0
@@ -251,7 +280,8 @@ def main():
     pc0 = (j0[:, 0] - cam_pos) @ R_c2w
     print(f"camera view: depth {pc0[:, 2].min():.1f}-{pc0[:, 2].max():.1f} m, |x/z| max {np.abs(pc0[:, 0] / pc0[:, 2]).max():.2f}, "
           f"path {np.ptp(j0[:, 0, 0]):.1f} x {np.ptp(j0[:, 0, 2]):.1f} m, {len(j0) / FPS:.1f} s")
-    agg = {m: {k: [] for k in keys} for m in ("raw", "legacy", "lsq")}
+    methods = ("raw", "legacy", "legacy+ik", "lsq", "lsq+lock")
+    agg = {m: {k: [] for k in keys} for m in methods}
     keep = None
     for seed in range(args.seed0, args.seed0 + args.seeds):
         rng = np.random.default_rng(seed)
@@ -263,17 +293,20 @@ def main():
             "lsq": lsq(pc, v, o, Rs, prob),
         }
         ms = {m: metrics(p, o, joints, contact) for m, p in res.items()}
+        ms["legacy+ik"] = metrics(res["legacy"], o, joints, contact, legacy_feet(res["legacy"], o, prob))
+        ms["lsq+lock"] = metrics(res["lsq"], o, joints, contact, lock_feet(res["lsq"], o, prob))
+        ms = {m: ms[m] for m in methods}
         for m in ms:
             for k in keys:
                 agg[m][k].append(ms[m][k])
         if seed == args.seed0:
             keep = {"truth": joints[::2, 0][:, [0, 2]].round(3).tolist(), "truth_height": joints[::2, 0, 1].round(3).tolist(),
                     **{m: {"path": ms[m]["path"], "height": ms[m]["height"]} for m in ms}}
-    print(f"{'':8s}" + "".join(f"{k:>18s}" for k in keys))
+    print(f"{'':10s}" + "".join(f"{k:>18s}" for k in keys))
     summary = {}
     for m in agg:
         summary[m] = {k: float(np.mean(agg[m][k])) for k in keys}
-        print(f"{m:8s}" + "".join(f"{summary[m][k]:18.2f}" for k in keys))
+        print(f"{m:10s}" + "".join(f"{summary[m][k]:18.2f}" for k in keys))
     if args.out:
         Path(args.out).write_text(json.dumps({"summary": summary, "example": keep, "fps": FPS, "every": 2}))
 

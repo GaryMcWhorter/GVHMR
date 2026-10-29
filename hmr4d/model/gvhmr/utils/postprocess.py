@@ -13,6 +13,7 @@ from hmr4d.utils.geo_transform import get_sequence_cammat, transform_mat, apply_
 from hmr4d.utils.net_utils import gaussian_smooth
 from hmr4d.model.gvhmr.utils.endecoder import EnDecoder
 from hmr4d.model.gvhmr.utils.static_cam_solve import solve_static_cam_root, chordal_mean
+from hmr4d.model.gvhmr.utils.foot_lock import contact_lock_targets, two_bone_ik
 
 from hmr4d.utils.wis3d_utils import make_wis3d, add_motion_as_lines
 
@@ -207,3 +208,57 @@ def process_ik(outputs, endecoder):
     body_pose = body_pose.flatten(2)  # (B, L, (J-1)*3)
 
     return body_pose
+
+
+@autocast(enabled=False)
+def process_footlock(outputs, endecoder, pin_to_floor=True, **lock_kwargs):
+    """Lock planted feet in place with analytic leg IK (replaces process_ik's leaky target blend).
+
+    Each contact interval of each ankle / toe joint gets one fixed world position; toes are
+    pinned to the floor (y = 0) when pin_to_floor, which matches pp_static_cam_lsq's ground.
+    Returns body_pose (B, L, 63).
+    """
+    glob_p = outputs["pred_smpl_params_global"]
+    prob = outputs["static_conf_logits"].sigmoid()  # (B, L, 6) for joints below
+    joint_ids = [7, 10, 8, 11]  # L_ankle, L_foot, R_ankle, R_foot (wrists are left alone)
+    w_j3d, local_mat, _ = endecoder.fk_v2(**glob_p, get_intermediate=True)
+    parents = endecoder.parents
+    B, L = w_j3d.shape[:2]
+    tgt = torch.zeros(B, L, 4, 3).to(w_j3d)
+    wt = torch.zeros(B, L, 4).to(w_j3d)
+    for b in range(B):
+        pos = w_j3d[b, :, joint_ids].double().cpu().numpy()
+        pb = prob[b, :, :4].double().cpu().numpy()
+        t_np, w_np = contact_lock_targets(pos, pb, ground=(), **lock_kwargs)
+        if pin_to_floor:
+            # drop each planted toe onto the floor and move its ankle's lock by the same amount,
+            # so the foot keeps its length and the toe can actually reach the floor
+            t_floor, _ = contact_lock_targets(pos, pb, ground=(1, 3), **lock_kwargs)
+            for ia, it in ((0, 1), (2, 3)):
+                dy = t_floor[:, it, 1] - t_np[:, it, 1]
+                t_np[:, it, 1] = t_floor[:, it, 1]
+                t_np[:, ia, 1] += dy * (w_np[:, ia] > 0)
+        tgt[b] = torch.from_numpy(t_np).to(tgt)
+        wt[b] = torch.from_numpy(w_np).to(wt)
+    legs = (((1, 4, 7, 10), 0, 1), ((2, 5, 8, 11), 2, 3))
+    for (hip, knee, ankle, toe), ia, it in legs:  # 1. put the ankles on their locks
+        local_mat = two_bone_ik(local_mat, parents, hip, knee, ankle, toe, tgt[:, :, ia], wt[:, :, ia])
+    glob = matrix.forward_kinematics(local_mat, parents)
+    for (hip, knee, ankle, toe), ia, it in legs:  # 2. aim each toe from where its ankle now is
+        p_a, p_t = glob[..., ankle, :3, 3], glob[..., toe, :3, 3]
+        toe_tgt = tgt[:, :, it].clone()
+        if pin_to_floor:
+            # a toe on the floor at bone length from the ankle, in the locked toe's direction
+            bone = (p_t - p_a).norm(dim=-1)
+            h = torch.sqrt((bone**2 - p_a[..., 1] ** 2).clamp(min=1e-8))
+            d = toe_tgt - p_a
+            d[..., 1] = 0
+            d = torch.nn.functional.normalize(d, dim=-1)
+            on_floor = p_a + d * h[..., None]
+            on_floor[..., 1] = 0.0
+            reachable = (p_a[..., 1] < bone)[..., None]
+            toe_tgt = torch.where(reachable, on_floor, toe_tgt)
+        local_mat = two_bone_ik(local_mat, parents, hip, knee, ankle, toe,
+                                p_a, torch.zeros_like(wt[:, :, ia]), toe_tgt, wt[:, :, it])
+    body_pose = matrix_to_axis_angle(matrix.get_rotation(local_mat[:, :, 1:]))
+    return body_pose.flatten(2)

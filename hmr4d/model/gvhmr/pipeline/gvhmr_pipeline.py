@@ -14,6 +14,7 @@ from hmr4d.model.gvhmr.utils.postprocess import (
     process_ik,
     pp_static_joint_cam,
     pp_static_cam_lsq,
+    process_footlock,
 )
 from hmr4d.model.gvhmr.utils import stats_compose
 
@@ -114,7 +115,10 @@ class Pipeline(nn.Module):
                     outputs["pred_smpl_params_global"]["transl"] = pp_static_joint_cam(outputs, self.endecoder)
                 else:
                     outputs["pred_smpl_params_global"]["transl"] = pp_static_joint(outputs, self.endecoder)
-                body_pose = process_ik(outputs, self.endecoder)
+                if static_cam and static_cam_pp == "lsq":  # floor is y = 0 after the lsq solve
+                    body_pose = process_footlock(outputs, self.endecoder, pin_to_floor=True)
+                else:
+                    body_pose = process_ik(outputs, self.endecoder)
                 decode_dict["body_pose"] = body_pose
                 outputs["pred_smpl_params_global"]["body_pose"] = body_pose
                 outputs["pred_smpl_params_incam"]["body_pose"] = body_pose
